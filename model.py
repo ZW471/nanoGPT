@@ -108,6 +108,34 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+class HC(nn.Module):
+    def __init__(self, n, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.n = n
+        self.alpha = nn.Parameter(torch.randn(n))
+        self.beta = nn.Parameter(torch.randn(n))
+        self.interaction = nn.Parameter(torch.randn(n, n))
+
+    def forward(self, H, layer):
+        res = torch.einsum('bled,ee->bled', H, self.interaction)
+        H = torch.einsum('bled,e->bld', H, self.alpha)
+        H = layer(H)
+        H = torch.einsum('bld,e->bled', H, self.beta)
+        return H + res
+
+class HCBlock(nn.Module):
+    def __init__(self, config, expansion=4):
+        super().__init__()
+        self.hc_1 = HC(expansion)
+        self.attn = CausalSelfAttention(config)
+        self.hc_2 = HC(expansion)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = self.hc_1(x, self.attn)
+        x = self.hc_2(x, self.mlp)
+        return x
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -130,7 +158,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),  # word token emb
             wpe = nn.Embedding(config.block_size, config.n_embd),  # work pos emb
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([HCBlock(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -180,8 +208,10 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        x = x.unsqueeze(-2).repeat(1, 1, 4, 1)
         for block in self.transformer.h:
             x = block(x)
+        x = x.sum(dim=-2)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -276,7 +306,7 @@ class GPT(nn.Module):
         for n, p in param_dict.items():
             if p.dim() < 2:
                 nodecay_params.append(p)
-            if 'transformer.h' in n and ('mlp' in n or 'attn' in n):
+            elif 'transformer.h' in n and ('mlp' in n or 'attn' in n):
                 muon_params.append(p)
             else:
                 adamw_decay_params.append(p)

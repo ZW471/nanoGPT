@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "datasets>=4.4.2",
+    "notebook>=7.5.1",
     "tiktoken>=0.12.0",
     "torch==2.9.0+cu126",
     "tqdm>=4.67.1",
