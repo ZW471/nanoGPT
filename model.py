@@ -15,6 +15,9 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from utils import CombinedOptimizer
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -124,8 +127,8 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),  # word token emb
+            wpe = nn.Embedding(config.block_size, config.n_embd),  # work pos emb
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -267,21 +270,37 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
+        adamw_decay_params = []
+        muon_params = []
+        nodecay_params = []
+        for n, p in param_dict.items():
+            if p.dim() < 2:
+                nodecay_params.append(p)
+            if 'transformer.h' in n and ('mlp' in n or 'attn' in n):
+                muon_params.append(p)
+            else:
+                adamw_decay_params.append(p)
+        adamw_optim_groups = [
+            {'params': adamw_decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
-        num_decay_params = sum(p.numel() for p in decay_params)
+        muon_optim_groups = [
+            {'params': muon_params, 'weight_decay': weight_decay},
+        ]
+        num_adamw_decay_params = sum(p.numel() for p in adamw_decay_params)
+        num_muon_decay_params = sum(p.numel() for p in muon_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num decayed AdamW parameter tensors: {len(adamw_decay_params)}, with {num_adamw_decay_params:,} parameters")
+        print(f"num decayed Muon parameter tensors: {len(muon_params)}, with {num_muon_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = CombinedOptimizer([
+            torch.optim.AdamW(adamw_optim_groups, lr=learning_rate, betas=betas, **extra_args),
+            torch.optim.Muon(muon_optim_groups, lr=learning_rate, adjust_lr_fn='match_rms_adamw')
+        ])
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
