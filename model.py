@@ -112,9 +112,9 @@ class HC(nn.Module):
     def __init__(self, n, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.n = n
-        self.alpha = nn.Parameter(torch.randn(n))
-        self.beta = nn.Parameter(torch.randn(n))
-        self.interaction = nn.Parameter(torch.randn(n, n))
+        self.alpha = nn.Parameter(torch.zeros(n))
+        self.beta = nn.Parameter(torch.ones(n))
+        self.interaction = nn.Parameter(torch.eye(n, n))
 
     def forward(self, H, layer):
         res = torch.einsum('bled,ee->bled', H, self.interaction)
@@ -123,12 +123,71 @@ class HC(nn.Module):
         H = torch.einsum('bld,e->bled', H, self.beta)
         return H + res
 
+class HyperConnection(nn.Module):
+    def __init__(self, dim, rate, layer_id, dynamic, device=None):
+        super(HyperConnection, self).__init__()
+
+        self.rate = rate
+        self.layer_id = layer_id
+        self.dynamic = dynamic
+
+        self.static_beta = nn.Parameter(torch.ones((rate,), device=device))
+
+        init_alpha0 = torch.zeros((rate, 1), device=device)
+        init_alpha0[layer_id % rate, 0] = 1.
+        self.static_alpha = nn.Parameter(torch.cat([init_alpha0, torch.eye((rate), device=device)], dim=1))
+
+        if self.dynamic:
+            self.dynamic_alpha_fn = nn.Parameter(torch.zeros((dim, rate+1), device=device))
+            self.dynamic_alpha_scale = nn.Parameter(torch.ones(1, device=device) * 0.01)
+            self.dynamic_beta_fn = nn.Parameter(torch.zeros((dim, ), device=device))
+            self.dynamic_beta_scale = nn.Parameter(torch.ones(1, device=device) * 0.01)
+            self.layer_norm = LayerNorm(dim)
+
+        self.ln = nn.LayerNorm(dim)
+
+    def forward(self, H, layer):
+        mix_h, beta = self.width_connection(H)
+        h = layer(self.ln(mix_h[..., 0, :]))
+        return self.depth_connection(mix_h, h, beta)
+
+    def width_connection(self, h):
+        # get alpha and beta
+        if self.dynamic:
+            norm_h = self.layer_norm(h)
+
+        if self.dynamic:
+            wc_weight = norm_h @ self.dynamic_alpha_fn
+            wc_weight = F.tanh(wc_weight)
+            dynamic_alpha = wc_weight * self.dynamic_alpha_scale
+            alpha = dynamic_alpha + self.static_alpha[None, None, ...]
+        else:
+            alpha = self.static_alpha[None, None, ...]
+
+        if self.dynamic:
+            dc_weight = norm_h @ self.dynamic_beta_fn
+            dc_weight = F.tanh(dc_weight)
+            dynamic_beta = dc_weight * self.dynamic_beta_scale
+            beta = dynamic_beta + self.static_beta[None, None, ...]
+        else:
+            beta = self.static_beta[None, None, ...]
+
+        # width connection
+        mix_h = alpha.transpose(-1, -2) @ h
+
+        return mix_h, beta
+
+    def depth_connection(self, mix_h, h_o, beta):
+        h = torch.einsum("blh,bln->blnh", h_o, beta) + mix_h[..., 1:, :]
+
+        return h
+
 class HCBlock(nn.Module):
-    def __init__(self, config, expansion=4):
+    def __init__(self, config, expansion=4, layer_id=0, dynamic=False, device=None):
         super().__init__()
-        self.hc_1 = HC(expansion)
+        self.hc_1 = HyperConnection(dim=config.n_embd, rate=expansion, layer_id=layer_id, dynamic=dynamic, device=device)
         self.attn = CausalSelfAttention(config)
-        self.hc_2 = HC(expansion)
+        self.hc_2 = HyperConnection(dim=config.n_embd, rate=expansion, layer_id=layer_id, dynamic=dynamic, device=device)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -158,7 +217,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),  # word token emb
             wpe = nn.Embedding(config.block_size, config.n_embd),  # work pos emb
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([HCBlock(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([HCBlock(config, layer_id=idx) for idx, _ in enumerate(range(config.n_layer))]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
