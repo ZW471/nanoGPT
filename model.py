@@ -94,6 +94,27 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+def find_multiple(a: int, b: int) -> int:
+    return (-(a // -b)) * b
+
+class SwiGLU(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.d_hidden: int = config.n_embd
+        self.expansion = 4
+        self.dropout = nn.Dropout(config.dropout)
+
+        self.d_intermediate = find_multiple(round(self.expansion * self.d_hidden * 2 / 3), 256)
+        self.proj = nn.Linear(self.d_hidden, self.d_intermediate * 2, bias=False)
+        self.out = nn.Linear(self.d_intermediate, self.d_hidden, bias=False)
+        self.activation = nn.SiLU()
+
+    def forward(self, x):
+        x, a = self.proj(x).chunk(2, dim=-1)
+        x = self.activation(x) * a
+        x = self.out(x)
+        return self.dropout(x)
+
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -101,7 +122,7 @@ class Block(nn.Module):
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+        self.mlp = SwiGLU(config)
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
@@ -188,7 +209,7 @@ class HCBlock(nn.Module):
         self.hc_1 = HyperConnection(dim=config.n_embd, rate=expansion, layer_id=layer_id, dynamic=dynamic, device=device)
         self.attn = CausalSelfAttention(config)
         self.hc_2 = HyperConnection(dim=config.n_embd, rate=expansion, layer_id=layer_id, dynamic=dynamic, device=device)
-        self.mlp = MLP(config)
+        self.mlp = SwiGLU(config)
 
     def forward(self, x):
         x = self.hc_1(x, self.attn)
