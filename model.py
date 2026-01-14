@@ -31,18 +31,25 @@ class LayerNorm(nn.Module):
 
 class CausalSelfAttention(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, gated=True): # added gated optional arg [cite: 14]
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+
+        # G1: Head-specific elementwise gating projection [cite: 14, 237, 238]
+        self.gated = gated
+        if self.gated:
+            # Matches the shape of query heads (n_head * head_dim) [cite: 247, 248]
+            self.mlp_gate_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
+        self.n_head: int = config.n_head
+        self.n_embd: int = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -72,7 +79,17 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+            # Apply SDPA output gating (G1 variant) [cite: 14, 28]
+        if self.gated:
+            # Compute head-specific gating scores using sigmoid [cite: 228, 241]
+            # 'x' represents the hidden states before the attention projections
+            gate = torch.sigmoid(self.mlp_gate_proj(x))
+            gate = gate.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+            # Multiplicative modulation [cite: 228, 240]
+            y = y * gate
+
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
@@ -276,7 +293,7 @@ class GPT(nn.Module):
         for n, p in param_dict.items():
             if p.dim() < 2:
                 nodecay_params.append(p)
-            if 'transformer.h' in n and ('mlp' in n or 'attn' in n):
+            elif 'transformer.h' in n and ('mlp' in n or 'attn' in n):
                 muon_params.append(p)
             else:
                 adamw_decay_params.append(p)

@@ -12,5 +12,4 @@ env/
 venv/
 /out/
 /out-shakespeare-char/
-/data/
 /wandb/
